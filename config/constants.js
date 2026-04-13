@@ -7,6 +7,8 @@ const STATE_DIR = path.join(HOME_DIR, ".br");
 const HISTORY_DIR = path.join(HOME_DIR, ".br-history");
 const LOG_DIR = path.join(STATE_DIR, "logs");
 const HISTORY_PATH = path.join(STATE_DIR, "history.json");
+const CURRENT_RUN_PATH = path.join(STATE_DIR, "current-run.json");
+const AGENT_HEARTBEAT_PATH = path.join(STATE_DIR, "agent-heartbeat.json");
 const LAST_RUN_PATH = path.join(HISTORY_DIR, "last-run.json");
 const LAUNCH_AGENT_DIR = path.join(
   HOME_DIR,
@@ -26,7 +28,9 @@ const DEFAULT_RCLONE_REMOTE = "br-s3";
 module.exports = {
   AGENT_LAUNCH_AGENT_LABEL,
   AGENT_LAUNCH_AGENT_PATH,
+  AGENT_HEARTBEAT_PATH,
   CONFIG_PATH,
+  CURRENT_RUN_PATH,
   DEFAULT_ENDPOINT,
   DEFAULT_RCLONE_REMOTE,
   FULL_LAUNCH_AGENT_LABEL,

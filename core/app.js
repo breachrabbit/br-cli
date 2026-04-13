@@ -1,5 +1,6 @@
 const { parseArgs } = require("./args");
 const { runBackupMode, printHistory } = require("../backup/runner");
+const { checkGitHealth, renderGitHealth } = require("../git/health");
 const { findLogPathByBackupId, getAvailableLogs, printLogFile, printLogList } = require("../backup/log-viewer");
 const { computeRetentionPlan, pruneLocalBackups } = require("../backup/retention");
 const { loadHistory, loadLastRuns, saveHistory } = require("../backup/history-service");
@@ -37,8 +38,9 @@ function printConfigWarnings(config) {
 
 function printHelp() {
   output.header("usage");
-  output.print("br run                 Run full backup");
-  output.print("br quick               Run quick backup");
+  output.print("br run [--smart|--strict]   Run full backup");
+  output.print("br quick [--smart|--strict] Run quick backup");
+  output.print("br doctor [--smart|--strict] Check repository health");
   output.print("br setup               Run setup wizard");
   output.print("br settings            Edit one configuration section");
   output.print("br history [--limit N] Show backup history");
@@ -57,6 +59,41 @@ function printHelp() {
   output.print("br update              Check for updates");
   output.print("br notify-test         Send a test macOS notification");
   output.print("br --debug             Show verbose errors");
+}
+
+function resolveGitMode(options) {
+  if (options.smart && options.strict) {
+    throw new Error("Use either --smart or --strict, not both.");
+  }
+
+  if (options.strict) {
+    return "strict";
+  }
+
+  if (options.smart) {
+    return "smart";
+  }
+
+  return "safe";
+}
+
+async function handleDoctor(options) {
+  ensureStateDirectories();
+  const config = await ensureConfigLoaded();
+  const gitMode = resolveGitMode(options);
+  const logger = {
+    error(message) {
+      output.debug(message);
+    },
+    info(message) {
+      output.debug(message);
+    },
+    warn(message) {
+      output.debug(message);
+    }
+  };
+  const results = checkGitHealth(config.repos, logger, { mode: gitMode });
+  renderGitHealth(results, gitMode.toUpperCase());
 }
 
 async function ensureConfigLoaded() {
@@ -325,7 +362,9 @@ async function run(argv) {
     case "run": {
       ensureStateDirectories();
       const config = await ensureConfigLoaded();
-      const result = await runBackupMode("full", config);
+      const result = await runBackupMode("full", config, {
+        gitMode: resolveGitMode(options)
+      });
       if (result.status !== "success") {
         process.exitCode = 1;
       }
@@ -335,12 +374,18 @@ async function run(argv) {
     case "quick": {
       ensureStateDirectories();
       const config = await ensureConfigLoaded();
-      const result = await runBackupMode("quick", config);
+      const result = await runBackupMode("quick", config, {
+        gitMode: resolveGitMode(options)
+      });
       if (result.status !== "success") {
         process.exitCode = 1;
       }
       return;
     }
+
+    case "doctor":
+      await handleDoctor(options);
+      return;
 
     case "history":
       ensureStateDirectories();

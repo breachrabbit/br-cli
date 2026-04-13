@@ -4,7 +4,9 @@ const { createRepoBackup } = require("./bundle");
 const { buildBackupMetadata } = require("./metadata");
 const { appendHistory, getLatestSuccessfulBackup } = require("./history-service");
 const { createLogger } = require("./log-service");
+const { clearCurrentRun, loadAgentHeartbeat, startCurrentRun, updateCurrentRun } = require("./runtime-state");
 const { createEnvBackup } = require("../env/backup");
+const { GitStatus, assertStrictHealth, checkGitHealth, healthSummaryLine, renderGitHealth } = require("../git/health");
 const { getRepoSnapshot, isGitRepository, pushRepositories } = require("../git/repository");
 const { uploadDirectory, uploadFile } = require("../core/storage/rclone");
 const { ensureDir } = require("../core/fs-utils");
@@ -62,6 +64,12 @@ function summarizeGitResults(results) {
         if (result.reason === "detached-head") {
           accumulator.detachedHead += 1;
         }
+        if (result.reason === "diverged") {
+          accumulator.diverged += 1;
+        }
+        if (result.reason === "dirty") {
+          accumulator.dirty += 1;
+        }
         if (result.reason === "not-git") {
           accumulator.notGit += 1;
         }
@@ -70,8 +78,94 @@ function summarizeGitResults(results) {
       }
       return accumulator;
     },
-    { detachedHead: 0, failed: 0, noOrigin: 0, noUpstream: 0, notGit: 0, remoteAhead: 0, skipped: 0, synced: 0 }
+    { detachedHead: 0, dirty: 0, diverged: 0, failed: 0, noOrigin: 0, noUpstream: 0, notGit: 0, remoteAhead: 0, skipped: 0, synced: 0 }
   );
+}
+
+function summarizeHealthResults(results) {
+  return results.reduce((summary, result) => {
+    if ([GitStatus.OK, GitStatus.UP_TO_DATE, GitStatus.AHEAD].includes(result.status)) {
+      summary.healthy += 1;
+      return summary;
+    }
+
+    if (result.status === GitStatus.ERROR) {
+      summary.errors += 1;
+    } else {
+      summary.warnings += 1;
+    }
+    return summary;
+  }, { errors: 0, healthy: 0, warnings: 0 });
+}
+
+function mapHealthToGitResult(result) {
+  switch (result.status) {
+    case GitStatus.DETACHED:
+      return {
+        name: result.name,
+        path: result.path,
+        reason: "detached-head",
+        skipped: true,
+        status: "warning",
+        summary: "detached HEAD (skipped)"
+      };
+    case GitStatus.BEHIND:
+      return {
+        name: result.name,
+        path: result.path,
+        reason: "remote-ahead",
+        skipped: true,
+        status: "warning",
+        summary: "remote ahead (pull required)"
+      };
+    case GitStatus.DIVERGED:
+      return {
+        name: result.name,
+        path: result.path,
+        reason: "diverged",
+        skipped: true,
+        status: "warning",
+        summary: "diverged (manual fix needed)"
+      };
+    case GitStatus.NO_UPSTREAM:
+      return {
+        name: result.name,
+        path: result.path,
+        reason: "no-upstream",
+        skipped: true,
+        status: "warning",
+        summary: "no upstream (not configured)"
+      };
+    case GitStatus.DIRTY:
+      return {
+        name: result.name,
+        path: result.path,
+        reason: "dirty",
+        skipped: true,
+        status: "warning",
+        summary: "uncommitted changes"
+      };
+    case GitStatus.ERROR:
+      return {
+        name: result.name,
+        path: result.path,
+        reason: "health-error",
+        status: "error",
+        summary: "failed"
+      };
+    default:
+      return {
+        name: result.name,
+        path: result.path,
+        reason: "up-to-date",
+        status: "success",
+        summary: "up-to-date"
+      };
+  }
+}
+
+function shouldAttemptPush(result) {
+  return [GitStatus.OK, GitStatus.UP_TO_DATE, GitStatus.AHEAD, GitStatus.DIRTY].includes(result.status);
 }
 
 function formatGitSkipReason(gitSummary) {
@@ -84,6 +178,12 @@ function formatGitSkipReason(gitSummary) {
   }
   if (gitSummary.detachedHead > 0) {
     reasons.push("detached HEAD");
+  }
+  if (gitSummary.diverged > 0) {
+    reasons.push("diverged");
+  }
+  if (gitSummary.dirty > 0) {
+    reasons.push("dirty working tree");
   }
   if (gitSummary.noOrigin > 0) {
     reasons.push("no origin");
@@ -118,6 +218,25 @@ function formatEnvSkipReason(reason) {
     return "no .env changes";
   }
   return reason || "no changes";
+}
+
+function isAgentActive() {
+  const heartbeat = loadAgentHeartbeat();
+  if (!heartbeat || !heartbeat.updatedAt || !heartbeat.pid) {
+    return false;
+  }
+
+  const ageMs = Date.now() - new Date(heartbeat.updatedAt).getTime();
+  if (ageMs > 15000) {
+    return false;
+  }
+
+  try {
+    process.kill(Number(heartbeat.pid), 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function printBackupSummary(summary) {
@@ -164,7 +283,7 @@ function printBackupSummary(summary) {
   );
 }
 
-async function runBackupMode(mode, config) {
+async function runBackupMode(mode, config, options = {}) {
   const startedAt = new Date();
   const backupId = getBackupId(startedAt);
   const dayStamp = getDayStamp(startedAt);
@@ -201,17 +320,67 @@ async function runBackupMode(mode, config) {
   };
   let displayedSizeLabel = "0 B";
   let totalUploadedBytes = 0;
+  const gitMode = options.gitMode || "safe";
+  const gitModeLabel = gitMode.toUpperCase();
+
+  function updateRuntime(patch) {
+    updateCurrentRun({
+      backupId,
+      elapsedMs: Date.now() - startedAt.getTime(),
+      mode,
+      pid: process.pid,
+      startedAt: startedAt.toISOString(),
+      ...patch
+    });
+  }
 
   try {
+    startCurrentRun({
+      backupId,
+      mode,
+      pid: process.pid,
+      startedAt: startedAt.toISOString(),
+      step: "starting",
+      percent: 0
+    });
     output.start(mode === "full" ? "Starting full backup" : "Starting quick backup");
+    updateRuntime({
+      step: "checking repository health"
+    });
+    const healthResults = checkGitHealth(config.repos, logger, {
+      mode: gitMode
+    });
+    renderGitHealth(healthResults, gitModeLabel);
+    if (gitMode === "strict") {
+      assertStrictHealth(healthResults);
+    }
+
     output.sync("Syncing repositories...");
     output.print("");
-    const gitResults = pushRepositories(config.repos, logger);
-    gitResults.forEach((result) => {
+    updateRuntime({
+      step: "syncing repositories"
+    });
+    const pushCandidates = healthResults.filter((result) => shouldAttemptPush(result));
+    const pushedResults = pushRepositories(
+      pushCandidates.map((result) => ({
+        name: result.name,
+        path: result.path
+      })),
+      logger
+    );
+    const pushedByName = new Map(pushedResults.map((result) => [result.name, result]));
+    const gitResults = healthResults.map((result) => pushedByName.get(result.name) || mapHealthToGitResult(result));
+    gitResults.forEach((result, index) => {
       output.statusLine(result.name, result.status, result.summary || result.reason || "");
+      updateRuntime({
+        currentRepo: result.name,
+        percent: gitResults.length > 0 ? Math.round(((index + 1) / gitResults.length) * 100) : 100,
+        step: "syncing repositories"
+      });
     });
     output.print("");
     const gitSummary = summarizeGitResults(gitResults);
+    const healthSummary = summarizeHealthResults(healthResults);
 
     const gitRepos = config.repos.filter((repo) => isGitRepository(repo.path));
     const backupCandidates =
@@ -225,8 +394,13 @@ async function runBackupMode(mode, config) {
         backupCandidates.forEach((repo) => {
           repoBackups.push(createRepoBackup(repo, reposDirectory, logger));
           progress.advance(repo.name);
+          updateRuntime({
+            currentRepo: repo.name,
+            percent: Math.round((repoBackups.length / backupCandidates.length) * 100),
+            step: "creating repository backups"
+          });
         });
-      });
+      }, { completeMessage: false });
     }
 
     const envBundle = createEnvBackup({
@@ -276,6 +450,11 @@ async function runBackupMode(mode, config) {
               onProgress(progress) {
                 const speedText = progress.speed ? ` • ${progress.speed}` : "";
                 set(progress.percent, `${progress.transferred} / ${progress.total}${speedText}`);
+                updateRuntime({
+                  detail: `${progress.transferred} / ${progress.total}${speedText}`,
+                  percent: progress.percent,
+                  step: "uploading repositories"
+                });
               }
             },
             reposDirectory,
@@ -295,6 +474,10 @@ async function runBackupMode(mode, config) {
       }
 
       output.info("Uploading backup manifest...");
+      updateRuntime({
+        percent: 100,
+        step: "uploading backup manifest"
+      });
       const manifestUpload = await uploadFile(config, manifestPath, s3Prefix);
       output.success(`Manifest uploaded to ${manifestUpload.remotePath}`);
       totalUploadedBytes += fs.statSync(manifestPath).size;
@@ -316,6 +499,11 @@ async function runBackupMode(mode, config) {
               onProgress(progress) {
                 const speedText = progress.speed ? ` • ${progress.speed}` : "";
                 set(progress.percent, `${progress.transferred} / ${progress.total}${speedText}`);
+                updateRuntime({
+                  detail: `${progress.transferred} / ${progress.total}${speedText}`,
+                  percent: progress.percent,
+                  step: "uploading environment backup"
+                });
               }
             },
             envBundle.backupPath,
@@ -378,8 +566,8 @@ async function runBackupMode(mode, config) {
     printBackupSummary({
       durationLabel: formatDuration(Date.now() - startedAt.getTime()),
       env: envSummary,
-      finalMessage: gitSummary.failed > 0 ? "Backup completed with warnings ⚠" : "Backup successful ✔",
-      finalStatus: gitSummary.failed > 0 ? "warning" : "success",
+      finalMessage: gitSummary.failed > 0 || healthSummary.warnings > 0 || healthSummary.errors > 0 ? "Backup completed with warnings ⚠" : "Backup successful ✔",
+      finalStatus: gitSummary.failed > 0 || healthSummary.warnings > 0 || healthSummary.errors > 0 ? "warning" : "success",
       git: {
         ...gitSummary,
         skipReason: formatGitSkipReason(gitSummary)
@@ -388,8 +576,8 @@ async function runBackupMode(mode, config) {
       totalSizeLabel: displayedSizeLabel || formatBytes(totalUploadedBytes)
     });
 
-    if (config.notificationEnabled && process.env.BR_SUPPRESS_CLI_NOTIFICATIONS !== "1") {
-      const notificationMessage = gitSummary.skipped > 0 || gitSummary.failed > 0
+    if (config.notificationEnabled && process.env.BR_SUPPRESS_CLI_NOTIFICATIONS !== "1" && !isAgentActive()) {
+      const notificationMessage = gitSummary.skipped > 0 || gitSummary.failed > 0 || healthSummary.warnings > 0 || healthSummary.errors > 0
         ? "Backup completed with git warnings"
         : noOp
           ? "Backup finished: nothing changed"
@@ -397,6 +585,7 @@ async function runBackupMode(mode, config) {
       notify("br", notificationMessage);
     }
 
+    clearCurrentRun();
     return metadata;
   } catch (error) {
     status = "error";
@@ -427,8 +616,8 @@ async function runBackupMode(mode, config) {
       envFingerprint: ""
     });
 
-    output.error(error.message);
-    if (config.notificationEnabled && process.env.BR_SUPPRESS_CLI_NOTIFICATIONS !== "1") {
+    clearCurrentRun();
+    if (config.notificationEnabled && process.env.BR_SUPPRESS_CLI_NOTIFICATIONS !== "1" && !isAgentActive()) {
       notify("br", "Backup failed");
     }
     throw error;

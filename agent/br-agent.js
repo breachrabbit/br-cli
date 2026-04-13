@@ -3,6 +3,7 @@
 const { spawn } = require("child_process");
 const path = require("path");
 const { loadLastRuns } = require("../backup/history-service");
+const { clearAgentHeartbeat, loadCurrentRun, updateAgentHeartbeat } = require("../backup/runtime-state");
 const { LAUNCHD_PATH } = require("../config/constants");
 const { hasConfig, loadConfig } = require("../config/store");
 const { ensureRcloneInstalled, testConnection } = require("../core/storage/rclone");
@@ -33,6 +34,8 @@ try {
 
 const state = {
   currentStep: "",
+  detail: "",
+  elapsedLabel: "",
   lastBackupId: null,
   lastExitCode: null,
   mode: null,
@@ -61,6 +64,19 @@ function runCommand(command, args = []) {
     stdio: "ignore"
   });
   child.unref();
+}
+
+function isProcessAlive(pid) {
+  if (!pid) {
+    return false;
+  }
+
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function notify(title, body) {
@@ -97,6 +113,7 @@ function parseBackupOutput(chunk) {
           const event = JSON.parse(line);
           if (event.type === "progress") {
             state.currentStep = String(event.label || "").toLowerCase();
+            state.detail = String(event.detail || "");
             state.percent = Number(event.percent);
             paintMenuThrottled();
             return;
@@ -113,6 +130,7 @@ function parseBackupOutput(chunk) {
 
       if (line.includes("Syncing repositories")) {
         state.currentStep = "syncing repositories";
+        state.detail = "";
         state.percent = null;
       } else if (line.includes("Creating repository backups")) {
         state.currentStep = "creating backups";
@@ -137,6 +155,7 @@ function runBrBackup(mode) {
   const command = mode === "quick" ? "quick" : "run";
   state.running = true;
   state.mode = mode;
+  state.detail = "";
   state.percent = null;
   state.currentStep = "starting";
   state.lastExitCode = null;
@@ -157,6 +176,7 @@ function runBrBackup(mode) {
 
   child.on("error", (error) => {
     state.running = false;
+    state.detail = "";
     state.currentStep = "failed";
     state.lastExitCode = 1;
     notify("BR Labs", `Backup failed: ${error.message}`);
@@ -165,6 +185,7 @@ function runBrBackup(mode) {
 
   child.on("close", (code) => {
     state.running = false;
+    state.detail = "";
     state.percent = null;
     state.lastExitCode = code;
     state.currentStep = code === 0 ? "completed" : "failed";
@@ -201,7 +222,9 @@ function backupStatusLabel() {
 
   const percent = Number.isFinite(state.percent) ? ` ${state.percent}%` : "";
   const step = state.currentStep ? ` • ${state.currentStep}` : "";
-  return `Backup running:${percent}${step}`;
+  const detail = state.detail ? ` • ${state.detail}` : "";
+  const elapsed = state.elapsedLabel ? ` • ${state.elapsedLabel}` : "";
+  return `Backup running:${percent}${step}${detail}${elapsed}`;
 }
 
 function statusIcon(status) {
@@ -227,6 +250,21 @@ function formatAgentTime(input) {
   }
 
   return formatRelativeTimestamp(input);
+}
+
+function formatElapsed(ms) {
+  const totalSeconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+  return `${seconds}s`;
 }
 
 function latestRunLabel() {
@@ -255,9 +293,25 @@ function formatScheduleLine(mode, value, loaded) {
 }
 
 function refreshStatus() {
+  const currentRun = loadCurrentRun();
+  if (currentRun && currentRun.status === "running" && isProcessAlive(currentRun.pid)) {
+    state.running = true;
+    state.mode = currentRun.mode;
+    state.detail = currentRun.detail || currentRun.currentRepo || "";
+    state.percent = Number.isFinite(currentRun.percent) ? currentRun.percent : null;
+    state.currentStep = currentRun.step || "running";
+    state.elapsedLabel = formatElapsed(currentRun.elapsedMs || (Date.now() - new Date(currentRun.startedAt).getTime()));
+  } else {
+    state.running = false;
+    state.detail = "";
+    state.percent = null;
+    state.currentStep = "";
+    state.elapsedLabel = "";
+  }
+
   const run = latestRun();
   if (run && run.backupId && state.lastBackupId && run.backupId !== state.lastBackupId && !state.running) {
-    notify("BR Labs", `Scheduled backup finished: ${statusIcon(run.status)} ${run.mode}`);
+    notify("BR Labs", `Backup finished: ${statusIcon(run.status)} ${run.mode}`);
   }
   if (run && run.backupId) {
     state.lastBackupId = run.backupId;
@@ -371,6 +425,10 @@ function buildMenu(renderMenu) {
       label: "View history"
     },
     {
+      click: () => openTerminal("br doctor"),
+      label: "Doctor"
+    },
+    {
       click: () => openTerminal("br logs"),
       label: "View logs"
     },
@@ -436,12 +494,29 @@ mb.on("ready", () => {
   if (app.dock) {
     app.dock.hide();
   }
+  app.setName("BR Labs");
+  updateAgentHeartbeat({
+    source: "br-agent"
+  });
   refreshStorageStatus();
   refreshStatus();
   renderMenu();
+  setInterval(() => {
+    updateAgentHeartbeat({
+      source: "br-agent"
+    });
+  }, 5000).unref();
+  setInterval(() => {
+    refreshStatus();
+    paintMenu();
+  }, 1000).unref();
   setInterval(() => {
     refreshStorageStatus();
     renderMenu();
   }, 60 * 1000).unref();
   setInterval(renderMenu, 30 * 1000).unref();
+});
+
+app.on("before-quit", () => {
+  clearAgentHeartbeat();
 });

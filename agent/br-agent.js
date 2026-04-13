@@ -460,11 +460,13 @@ function refreshStorageStatus() {
   }
 }
 
+function noop() {}
+
 function buildMenu(renderMenu) {
   return Menu.buildFromTemplate([
     {
       enabled: false,
-      label: "BR Labs"
+      label: "BR Labs CLI"
     },
     {
       type: "separator"
@@ -479,12 +481,21 @@ function buildMenu(renderMenu) {
       enabled: !state.running,
       label: "Run quick backup"
     },
+    ...(state.running ? [
+      {
+        type: "separator"
+      },
+      {
+        click: noop,
+        label: backupStatusLabel()
+      }
+    ] : []),
     {
       type: "separator"
     },
     {
       enabled: false,
-      label: backupStatusLabel()
+      label: state.running ? latestRunLabel() : backupStatusLabel()
     },
     {
       enabled: false,

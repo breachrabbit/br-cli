@@ -27,6 +27,14 @@ The system is built to be:
 
 ---
 
+## ✦ Installation
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/breachrabbit/br-cli/main/installer/install.sh | bash
+```
+
+---
+
 ## ✦ Components
 
 BR Labs is not just a CLI.
@@ -411,14 +419,6 @@ This ensures:
 
 * reliability (launchd)
 * visibility (agent)
-
----
-
-## ✦ Installation
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/breachrabbit/br-cli/main/installer/install.sh | bash
-```
 
 ---
 

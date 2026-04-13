@@ -11,12 +11,15 @@ function buildBackupMetadata(input) {
     localPath: input.localPath,
     s3Prefix: input.s3Prefix || null,
     envS3Prefix: input.envS3Prefix || null,
+    manifestRemotePath: input.manifestRemotePath || null,
     repoSnapshots: input.repoSnapshots || {},
     repoBackups: input.repoBackups || [],
     envBundle: input.envBundle || null,
     gitResults: input.gitResults || [],
     parentBackupId: input.parentBackupId || null,
-    noOp: Boolean(input.noOp)
+    noOp: Boolean(input.noOp),
+    restoreReady: Boolean(input.restoreReady),
+    uploadVerified: Boolean(input.uploadVerified)
   };
 }
 

@@ -1,12 +1,13 @@
 const fs = require("fs");
 const path = require("path");
 const { createRepoBackup } = require("./bundle");
+const { isRestoreReady, toArchiveRecord, verifyBackupArtifacts, verifyUploadedArtifacts } = require("./consistency");
 const { buildBackupMetadata } = require("./metadata");
 const { appendHistory, getLatestSuccessfulBackup } = require("./history-service");
 const { createLogger } = require("./log-service");
 const { clearCurrentRun, loadAgentHeartbeat, startCurrentRun, updateCurrentRun } = require("./runtime-state");
 const { createEnvBackup } = require("../env/backup");
-const { GitStatus, assertStrictHealth, checkGitHealth, healthSummaryLine, renderGitHealth } = require("../git/health");
+const { GitStatus, assertStrictHealth, checkGitHealth, renderGitHealth } = require("../git/health");
 const { getRepoSnapshot, isGitRepository, pushRepositories } = require("../git/repository");
 const { uploadDirectory, uploadFile } = require("../core/storage/rclone");
 const { ensureDir } = require("../core/fs-utils");
@@ -304,6 +305,14 @@ async function runBackupMode(mode, config, options = {}) {
     ? previousSuccess.repoSnapshots || previousSuccess.sourceSnapshots || {}
     : {};
   const previousEnvFingerprint = previousSuccess ? previousSuccess.envFingerprint || "" : "";
+  const repoBackups = [];
+  let envBundle = {
+    skipped: true,
+    reason: "no-env-files"
+  };
+  let manifestRemotePath = null;
+  let gitSummary = { detachedHead: 0, dirty: 0, diverged: 0, failed: 0, noOrigin: 0, noUpstream: 0, notGit: 0, remoteAhead: 0, skipped: 0, synced: 0 };
+  let healthSummary = { errors: 0, healthy: 0, warnings: 0 };
 
   let metadata;
   let status = "success";
@@ -379,8 +388,8 @@ async function runBackupMode(mode, config, options = {}) {
       });
     });
     output.print("");
-    const gitSummary = summarizeGitResults(gitResults);
-    const healthSummary = summarizeHealthResults(healthResults);
+    gitSummary = summarizeGitResults(gitResults);
+    healthSummary = summarizeHealthResults(healthResults);
 
     const gitRepos = config.repos.filter((repo) => isGitRepository(repo.path));
     const backupCandidates =
@@ -388,7 +397,6 @@ async function runBackupMode(mode, config, options = {}) {
         ? gitRepos
         : determineQuickCandidates(gitRepos, previousSnapshots);
 
-    const repoBackups = [];
     if (backupCandidates.length > 0) {
       await withStepProgress("Creating repository backups", backupCandidates.length, async (progress) => {
         backupCandidates.forEach((repo) => {
@@ -403,7 +411,7 @@ async function runBackupMode(mode, config, options = {}) {
       }, { completeMessage: false });
     }
 
-    const envBundle = createEnvBackup({
+    envBundle = createEnvBackup({
       repos: gitRepos,
       runRoot: localPath,
       envEncryption: config.envEncryption,
@@ -416,6 +424,22 @@ async function runBackupMode(mode, config, options = {}) {
     const envS3Prefix = `env/${dayStamp}/${backupId}`;
     const noOp = backupCandidates.length === 0 && Boolean(envBundle.skipped);
 
+    output.info("Verifying backup integrity...");
+    const verifiedArtifacts = await verifyBackupArtifacts({
+      config,
+      envBundle,
+      logger,
+      repoBackups
+    });
+    const verifiedRepoBackups = verifiedArtifacts.repoBackups;
+    envBundle = verifiedArtifacts.envBundle;
+    output.success("Repositories verified");
+    if (!envBundle || envBundle.skipped) {
+      output.warn("Environment archive skipped");
+    } else {
+      output.success("Environment archive verified");
+    }
+
     metadata = buildBackupMetadata({
       backupId,
       mode,
@@ -427,21 +451,29 @@ async function runBackupMode(mode, config, options = {}) {
       s3Prefix,
       envS3Prefix,
       repoSnapshots,
-      repoBackups: repoBackups.map((item) => ({
+      repoBackups: verifiedRepoBackups.map((item) => ({
         name: item.name,
-        path: item.path,
-        size: item.size
+        remotePath: item.remotePath || null,
+        ...toArchiveRecord({
+          archivePath: item.archivePath,
+          archiveSizeBytes: item.archiveSizeBytes,
+          integrityVerified: item.integrityVerified,
+          sha256: item.sha256,
+          uploadVerified: item.uploadVerified
+        })
       })),
       envBundle,
       gitResults,
       parentBackupId: mode === "quick" && previousSuccess ? previousSuccess.backupId : null,
-      noOp
+      noOp,
+      restoreReady: false,
+      uploadVerified: false
     });
 
     fs.writeFileSync(manifestPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
 
     if (!noOp) {
-      if (repoBackups.length > 0) {
+      if (metadata.repoBackups.length > 0) {
         output.upload("Uploading repositories...");
         const repoUpload = await withPercentProgress("Repository upload progress", ({ set }) =>
           uploadDirectory(
@@ -461,7 +493,11 @@ async function runBackupMode(mode, config, options = {}) {
             `${s3Prefix}/repositories`
           )
         , { completeMessage: false, failMessage: "Repository upload failed" });
-        output.success(`Uploaded (${repoUpload.transferred || formatBytes(repoBackups.reduce((sum, item) => sum + item.size, 0))})`);
+        metadata.repoBackups = metadata.repoBackups.map((item) => ({
+          ...item,
+          remotePath: `${s3Prefix}/repositories/${path.basename(item.archivePath)}`
+        }));
+        output.success(`Uploaded (${repoUpload.transferred || formatBytes(metadata.repoBackups.reduce((sum, item) => sum + item.archiveSizeBytes, 0))})`);
         storageSummary = {
           status: "success",
           label: "uploaded",
@@ -469,25 +505,8 @@ async function runBackupMode(mode, config, options = {}) {
             ? `${repoUpload.transferred}${repoUpload.speed ? ` • ${repoUpload.speed}` : ""}`
             : repoUpload.remotePath
         };
-        displayedSizeLabel = repoUpload.transferred || formatBytes(repoBackups.reduce((sum, item) => sum + item.size, 0));
-        totalUploadedBytes += repoBackups.reduce((sum, item) => sum + item.size, 0);
-      }
-
-      output.info("Uploading backup manifest...");
-      updateRuntime({
-        percent: 100,
-        step: "uploading backup manifest"
-      });
-      const manifestUpload = await uploadFile(config, manifestPath, s3Prefix);
-      output.success(`Manifest uploaded to ${manifestUpload.remotePath}`);
-      totalUploadedBytes += fs.statSync(manifestPath).size;
-      if (storageSummary.status !== "success") {
-        storageSummary = {
-          status: "success",
-          label: "uploaded",
-          detail: manifestUpload.remotePath
-        };
-        displayedSizeLabel = formatBytes(fs.statSync(manifestPath).size);
+        displayedSizeLabel = repoUpload.transferred || formatBytes(metadata.repoBackups.reduce((sum, item) => sum + item.archiveSizeBytes, 0));
+        totalUploadedBytes += metadata.repoBackups.reduce((sum, item) => sum + item.archiveSizeBytes, 0);
       }
 
       if (!envBundle.skipped && envBundle.backupPath) {
@@ -511,6 +530,12 @@ async function runBackupMode(mode, config, options = {}) {
           )
         , { completeMessage: false, failMessage: "Environment upload failed" });
         output.success(`Env backup uploaded to ${envUpload.remotePath}`);
+        envBundle = {
+          ...envBundle,
+          remotePath: `${envS3Prefix}/${path.basename(envBundle.backupPath)}`,
+          uploadVerified: false
+        };
+        metadata.envBundle = envBundle;
         envSummary = {
           status: "success",
           label: "saved",
@@ -524,6 +549,68 @@ async function runBackupMode(mode, config, options = {}) {
           detail: formatEnvSkipReason(envBundle.reason)
         };
       }
+
+      output.info("Uploading backup manifest...");
+      updateRuntime({
+        percent: 100,
+        step: "uploading backup manifest"
+      });
+      let manifestUpload = await uploadFile(config, manifestPath, s3Prefix);
+      manifestRemotePath = `${s3Prefix}/${path.basename(manifestPath)}`;
+      metadata.manifestRemotePath = manifestRemotePath;
+      output.success(`Manifest uploaded to ${manifestUpload.remotePath}`);
+      totalUploadedBytes += fs.statSync(manifestPath).size;
+      if (storageSummary.status !== "success") {
+        storageSummary = {
+          status: "success",
+          label: "uploaded",
+          detail: manifestUpload.remotePath
+        };
+        displayedSizeLabel = formatBytes(fs.statSync(manifestPath).size);
+      }
+
+      output.info("Verifying uploaded backups...");
+      const uploadedArtifacts = await verifyUploadedArtifacts({
+        config,
+        envBundle: metadata.envBundle,
+        manifestArtifact: {
+          archivePath: manifestPath,
+          archiveSizeBytes: fs.statSync(manifestPath).size,
+          remotePath: manifestRemotePath
+        },
+        repoBackups: metadata.repoBackups
+      });
+      metadata.repoBackups = uploadedArtifacts.repoBackups;
+      metadata.envBundle = uploadedArtifacts.envBundle;
+      metadata.uploadVerified = true;
+      output.success("Uploaded repositories verified");
+      if (!metadata.envBundle || metadata.envBundle.skipped) {
+        output.warn("Environment archive skipped");
+      } else {
+        output.success("Environment upload verified");
+      }
+      output.success("Upload verified");
+
+      metadata.restoreReady = isRestoreReady(metadata);
+      if (metadata.restoreReady) {
+        output.success("Backup marked restore-ready");
+      }
+
+      fs.writeFileSync(manifestPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+      manifestUpload = await uploadFile(config, manifestPath, s3Prefix);
+      const verifiedManifest = await verifyUploadedArtifacts({
+        config,
+        envBundle: metadata.envBundle && metadata.envBundle.skipped ? metadata.envBundle : null,
+        manifestArtifact: {
+          archivePath: manifestPath,
+          archiveSizeBytes: fs.statSync(manifestPath).size,
+          remotePath: manifestRemotePath
+        },
+        repoBackups: []
+      });
+      metadata.uploadVerified = metadata.uploadVerified && verifiedManifest.manifestArtifact.uploadVerified;
+      metadata.restoreReady = isRestoreReady(metadata);
+      fs.writeFileSync(manifestPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
     } else {
       storageSummary = {
         status: "warning",
@@ -558,6 +645,8 @@ async function runBackupMode(mode, config, options = {}) {
       logPath: logger.filePath,
       sizeLabel: displayedSizeLabel || formatBytes(totalUploadedBytes),
       totalSizeBytes: totalUploadedBytes,
+      uploadVerified: metadata.uploadVerified,
+      restoreReady: metadata.restoreReady,
       repoSnapshots,
       envFingerprint: envBundle.fingerprint || "",
       parentBackupId: metadata.parentBackupId || null
@@ -598,7 +687,22 @@ async function runBackupMode(mode, config, options = {}) {
       dayStamp,
       status,
       errorMessage,
-      localPath
+      localPath,
+      manifestRemotePath,
+      repoBackups: repoBackups.map((item) => ({
+        name: item.name,
+        remotePath: item.remotePath || null,
+        ...toArchiveRecord({
+          archivePath: item.archivePath || item.path,
+          archiveSizeBytes: item.archiveSizeBytes || item.size || 0,
+          integrityVerified: Boolean(item.integrityVerified),
+          sha256: item.sha256 || "",
+          uploadVerified: Boolean(item.uploadVerified)
+        })
+      })),
+      envBundle,
+      restoreReady: false,
+      uploadVerified: false
     });
     fs.writeFileSync(manifestPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
     appendHistory({
@@ -612,7 +716,9 @@ async function runBackupMode(mode, config, options = {}) {
       manifestPath,
       logPath: logger.filePath,
       durationMs: Date.now() - startedAt.getTime(),
+      restoreReady: false,
       repoSnapshots: {},
+      uploadVerified: false,
       envFingerprint: ""
     });
 

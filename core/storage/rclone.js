@@ -272,6 +272,50 @@ function listBackups(config, remotePath = "") {
     .filter(Boolean);
 }
 
+function listRemoteEntries(config, remotePath = "") {
+  const rclonePath = ensureRcloneInstalled(config);
+  const result = runCommand(
+    rclonePath,
+    ["lsjson", buildRemotePath(config, remotePath)],
+    { allowFailure: true }
+  );
+
+  if (result.status !== 0) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(result.stdout || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function verifyRemoteFile(config, remotePath, expectedSizeBytes = null) {
+  const directory = path.posix.dirname(remotePath);
+  const fileName = path.posix.basename(remotePath);
+  const entries = listRemoteEntries(config, directory === "." ? "" : directory);
+  const remoteEntry = entries.find((entry) => entry.Name === fileName || entry.Path === fileName);
+
+  if (!remoteEntry) {
+    return {
+      remotePath: buildRemotePath(config, remotePath),
+      remoteSizeBytes: 0,
+      verified: false
+    };
+  }
+
+  const remoteSizeBytes = Number(remoteEntry.Size || 0);
+  const sizeMatches = expectedSizeBytes == null || Number(expectedSizeBytes) === remoteSizeBytes;
+
+  return {
+    remotePath: buildRemotePath(config, remotePath),
+    remoteSizeBytes,
+    verified: sizeMatches
+  };
+}
+
 module.exports = {
   buildRemotePath,
   configureRemote,
@@ -279,7 +323,9 @@ module.exports = {
   ensureRcloneInstalled,
   getRclonePath,
   listBackups,
+  listRemoteEntries,
   testConnection,
   uploadDirectory,
-  uploadFile
+  uploadFile,
+  verifyRemoteFile
 };

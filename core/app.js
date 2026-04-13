@@ -1,9 +1,10 @@
 const { parseArgs } = require("./args");
 const { runBackupMode, printHistory } = require("../backup/runner");
+const { verifyBackupManifest } = require("../backup/consistency");
 const { checkGitHealth, renderGitHealth } = require("../git/health");
 const { findLogPathByBackupId, getAvailableLogs, printLogFile, printLogList } = require("../backup/log-viewer");
 const { computeRetentionPlan, pruneLocalBackups } = require("../backup/retention");
-const { loadHistory, loadLastRuns, saveHistory } = require("../backup/history-service");
+const { findBackupById, loadHistory, loadLastRuns, saveHistory } = require("../backup/history-service");
 const { runSettingsMenu } = require("../config/settings");
 const { runSetupWizard } = require("../config/setup");
 const { ensureStateDirectories, hasConfig, loadConfig, saveConfig } = require("../config/store");
@@ -41,6 +42,7 @@ function printHelp() {
   output.print("br run [--smart|--strict]   Run full backup");
   output.print("br quick [--smart|--strict] Run quick backup");
   output.print("br doctor [--smart|--strict] Check repository health");
+  output.print("br verify [--backup ID]     Verify backup consistency");
   output.print("br setup               Run setup wizard");
   output.print("br settings            Edit one configuration section");
   output.print("br history [--limit N] Show backup history");
@@ -94,6 +96,40 @@ async function handleDoctor(options) {
   };
   const results = checkGitHealth(config.repos, logger, { mode: gitMode });
   renderGitHealth(results, gitMode.toUpperCase());
+}
+
+async function handleVerify(options) {
+  ensureStateDirectories();
+  const backupId = options.backup || options["backup-id"] || "";
+  const entry = backupId ? findBackupById(String(backupId)) : loadHistory()[0] || null;
+
+  if (!entry) {
+    throw new Error(backupId ? `Backup not found: ${backupId}` : "No backups recorded yet.");
+  }
+
+  const config = hasConfig() ? loadConfig() : null;
+  const manifest = await verifyBackupManifest(entry, config);
+
+  output.header("verify");
+  output.print(`Backup: ${manifest.backupId}`);
+  output.print("");
+  output.info("Verifying backup integrity...");
+  output.success("Repositories verified");
+  if (!manifest.envBundle || manifest.envBundle.skipped) {
+    output.warn("Environment archive skipped");
+  } else {
+    output.success("Environment archive verified");
+  }
+  if (manifest.uploadVerified) {
+    output.success("Upload verified");
+  } else {
+    output.warn("Upload not verified");
+  }
+  if (manifest.restoreReady) {
+    output.success("Backup marked restore-ready");
+  } else {
+    output.warn("Backup is not restore-ready");
+  }
 }
 
 async function ensureConfigLoaded() {
@@ -385,6 +421,10 @@ async function run(argv) {
 
     case "doctor":
       await handleDoctor(options);
+      return;
+
+    case "verify":
+      await handleVerify(options);
       return;
 
     case "history":

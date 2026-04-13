@@ -104,6 +104,7 @@ function createEnvBackup({ repos, runRoot, envEncryption, logger, quickFingerpri
   runCommand("tar", ["-czf", backupPath, "-C", sourceDir, "."]);
 
   let finalPath = backupPath;
+  let verificationPath = backupPath;
   let encrypted = false;
 
   if (envEncryption && envEncryption.enabled) {
@@ -112,7 +113,6 @@ function createEnvBackup({ repos, runRoot, envEncryption, logger, quickFingerpri
     if (result) {
       encrypted = true;
       finalPath = encryptedPath;
-      fs.unlinkSync(backupPath);
     } else {
       logger.warn("Env encryption enabled, but passphrase command did not return a value. Saving plain env backup.");
     }
@@ -124,7 +124,8 @@ function createEnvBackup({ repos, runRoot, envEncryption, logger, quickFingerpri
     backupPath: finalPath,
     encrypted,
     fileCount: envFiles.length,
-    fingerprint
+    fingerprint,
+    verificationPath
   };
 }
 

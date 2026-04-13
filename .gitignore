@@ -1,0 +1,48 @@
+# dependencies
+node_modules/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# system
+.DS_Store
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# local config
+.br-config.json
+*.local.json
+
+# rclone / aws local state
+.config/
+.aws/
+
+# build / cache
+dist/
+build/
+.tmp/
+temp/
+.cache/
+
+# backup output
+Backups/
+br-backups/
+*.tar.gz
+*.zip
+
+# editor
+.vscode/
+.idea/
+
+# test / coverage
+coverage/
+
+# misc
+*.pid

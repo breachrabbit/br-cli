@@ -1,0 +1,11 @@
+#!/usr/bin/env node
+
+const { run } = require("../core/app");
+const output = require("../ui/output");
+
+output.setDebug(process.argv.includes("--debug"));
+
+run(process.argv.slice(2)).catch((error) => {
+  output.printError(error);
+  process.exit(1);
+});

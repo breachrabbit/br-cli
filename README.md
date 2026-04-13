@@ -1,4 +1,4 @@
-# BR Labs CLI
+# BR Labs.vault
 
 <img width="1076" height="700" alt="br-cli" src="https://github.com/user-attachments/assets/475aeb6c-e37f-49e3-a514-f4187bdbe522" />
 

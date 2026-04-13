@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const { spawn } = require("child_process");
+const fs = require("fs");
 const path = require("path");
 const { loadLastRuns } = require("../backup/history-service");
 const { clearAgentHeartbeat, loadCurrentRun, updateAgentHeartbeat } = require("../backup/runtime-state");
@@ -53,6 +54,8 @@ const state = {
 };
 
 let lastMenuPaintAt = 0;
+let lastTrayStatus = "";
+const trayIconCache = new Map();
 
 function runCommand(command, args = []) {
   const child = spawn(command, args, {
@@ -215,6 +218,21 @@ function latestRun() {
   return runs.sort((left, right) => new Date(right.endedAt) - new Date(left.endedAt))[0];
 }
 
+function latestStatus() {
+  const run = latestRun();
+  if (!run) {
+    return "idle";
+  }
+
+  if (run.status === "error") {
+    return "error";
+  }
+  if (run.status === "warning") {
+    return "warning";
+  }
+  return "success";
+}
+
 function backupStatusLabel() {
   if (!state.running) {
     return latestRunLabel();
@@ -290,6 +308,78 @@ function formatScheduleLine(mode, value, loaded) {
     ? `every ${value.intervalMinutes / 60}h`
     : `every ${value.intervalMinutes}m`;
   return `quick: ${interval} • ${status}`;
+}
+
+function deriveTrayStatus() {
+  if (state.running) {
+    return "running";
+  }
+
+  if (!hasConfig()) {
+    return "idle";
+  }
+
+  return latestStatus();
+}
+
+function badgeColor(status) {
+  if (status === "success") {
+    return "#2ECC71";
+  }
+  if (status === "warning") {
+    return "#F4C542";
+  }
+  if (status === "error") {
+    return "#FF5F57";
+  }
+  if (status === "running") {
+    return "#5DADE2";
+  }
+  return "";
+}
+
+function createBadgeSvg(basePngPath, size, status) {
+  const color = badgeColor(status);
+  const basePng = fs.readFileSync(basePngPath).toString("base64");
+  const badge = color
+    ? `
+      <circle cx="${size - 8}" cy="${size - 8}" r="${size === 44 ? 6 : 3.5}" fill="${color}" stroke="#1F2430" stroke-width="${size === 44 ? 3 : 1.5}" />
+    `
+    : "";
+
+  return `
+    <svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+      <image href="data:image/png;base64,${basePng}" x="0" y="0" width="${size}" height="${size}" />
+      ${badge}
+    </svg>
+  `;
+}
+
+function createTrayIcon(status = "idle") {
+  const cacheKey = status || "idle";
+  if (trayIconCache.has(cacheKey)) {
+    return trayIconCache.get(cacheKey);
+  }
+
+  const oneX = path.join(__dirname, "..", "ui", "assets", "menubar-iconTemplate.png");
+  const twoX = path.join(__dirname, "..", "ui", "assets", "menubar-iconTemplate@2x.png");
+  const svgOneX = createBadgeSvg(oneX, 22, status);
+  const svgTwoX = createBadgeSvg(twoX, 44, status);
+  const icon = nativeImage.createEmpty();
+  icon.addRepresentation({
+    buffer: nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svgOneX).toString("base64")}`).toPNG(),
+    height: 22,
+    scaleFactor: 1,
+    width: 22
+  });
+  icon.addRepresentation({
+    buffer: nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svgTwoX).toString("base64")}`).toPNG(),
+    height: 44,
+    scaleFactor: 2,
+    width: 44
+  });
+  trayIconCache.set(cacheKey, icon);
+  return icon;
 }
 
 function refreshStatus() {
@@ -453,26 +543,28 @@ function buildMenu(renderMenu) {
   ]);
 }
 
-function createTrayIcon() {
-  const iconPath = path.join(__dirname, "..", "ui", "assets", "menubar-iconTemplate.png");
-  const icon = nativeImage.createFromPath(iconPath);
-  icon.setTemplateImage(true);
-  return icon;
-}
-
 const mb = menubar({
   browserWindow: {
     height: 1,
     show: false,
     width: 1
   },
-  icon: createTrayIcon(),
+  icon: createTrayIcon("idle"),
   preloadWindow: false,
   showDockIcon: false,
   tooltip: "BR Labs"
 });
 
 function paintMenu() {
+  const trayStatus = deriveTrayStatus();
+  if (trayStatus !== lastTrayStatus) {
+    const icon = createTrayIcon(trayStatus);
+    mb.tray.setImage(icon);
+    if (typeof mb.tray.setPressedImage === "function") {
+      mb.tray.setPressedImage(icon);
+    }
+    lastTrayStatus = trayStatus;
+  }
   mb.tray.setContextMenu(buildMenu(renderMenu));
 }
 

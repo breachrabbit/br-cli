@@ -9,6 +9,7 @@ const { LAUNCHD_PATH } = require("../config/constants");
 const { hasConfig, loadConfig } = require("../config/store");
 const { ensureRcloneInstalled, testConnection } = require("../core/storage/rclone");
 const { formatRelativeTimestamp } = require("../core/time");
+const { notify: notifySystem } = require("../ui/notifications");
 const { getLaunchdRuntimeStatus, getScheduleStatus } = require("../scheduler/launchd");
 
 try {
@@ -83,9 +84,6 @@ function isProcessAlive(pid) {
 }
 
 function notify(title, body) {
-  if (!Notification || !Notification.isSupported()) {
-    return;
-  }
   try {
     if (hasConfig() && loadConfig().notificationEnabled === false) {
       return;
@@ -94,11 +92,24 @@ function notify(title, body) {
     // Notification fallback should never crash the agent.
   }
 
-  new Notification({
-    body,
-    icon: path.join(__dirname, "..", "ui", "assets", "icon.png"),
-    title
-  }).show();
+  let delivered = false;
+
+  try {
+    if (Notification && Notification.isSupported()) {
+      new Notification({
+        body,
+        icon: path.join(__dirname, "..", "ui", "assets", "icon.png"),
+        title
+      }).show();
+      delivered = true;
+    }
+  } catch (_) {
+    delivered = false;
+  }
+
+  if (!delivered) {
+    notifySystem(title, body);
+  }
 }
 
 function stripAnsi(value) {
@@ -513,6 +524,10 @@ function buildMenu(renderMenu) {
     {
       click: () => openTerminal("br history"),
       label: "View history"
+    },
+    {
+      click: () => notify("BR Labs", "Agent notification test"),
+      label: "Test notification"
     },
     {
       click: () => openTerminal("br doctor"),

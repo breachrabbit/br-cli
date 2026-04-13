@@ -98,7 +98,6 @@ function notify(title, body) {
     if (Notification && Notification.isSupported()) {
       new Notification({
         body,
-        icon: path.join(__dirname, "..", "ui", "assets", "icon.png"),
         title
       }).show();
       delivered = true;
@@ -610,6 +609,9 @@ function renderMenu() {
 
 mb.on("ready", () => {
   if (app.dock) {
+    if (typeof app.dock.setIcon === "function") {
+      app.dock.setIcon(path.join(__dirname, "..", "ui", "assets", "icon.png"));
+    }
     app.dock.hide();
   }
   app.setName("BR Labs");
